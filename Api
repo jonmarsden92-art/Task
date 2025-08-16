@@ -1,0 +1,647 @@
+// TaskFlow Backend - Complete Node.js/Express API Server
+// Run with: npm install express bcryptjs jsonwebtoken multer stripe nodemailer
+// Then: node server.js
+
+const express = require(‘express’);
+const bcrypt = require(‘bcryptjs’);
+const jwt = require(‘jsonwebtoken’);
+const multer = require(‘multer’);
+const cors = require(‘cors’);
+const rateLimit = require(‘express-rate-limit’);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || ‘your-super-secret-jwt-key-change-in-production’;
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: ‘10mb’ }));
+app.use(express.static(‘public’));
+
+// Rate limiting
+const limiter = rateLimit({
+windowMs: 15 * 60 * 1000, // 15 minutes
+max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(’/api/’, limiter);
+
+// File upload configuration
+const storage = multer.diskStorage({
+destination: (req, file, cb) => {
+cb(null, ‘uploads/’);
+},
+filename: (req, file, cb) => {
+cb(null, Date.now() + ‘-’ + Math.round(Math.random() * 1E9) + ‘.’ + file.originalname.split(’.’).pop());
+}
+});
+const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } });
+
+// In-memory database (replace with real database in production)
+let users = [];
+let tasks = [];
+let submissions = [];
+let transactions = [];
+let notifications = [];
+
+// Sample data initialization
+let sampleTasks = [
+{
+id: 1,
+title: “Rate restaurant photos”,
+description: “Rate the quality of restaurant photos on a scale of 1-5”,
+category: “Quick Rating”,
+reward: 0.25,
+timeEstimate: “30 sec”,
+requiredSkills: [“Basic English”],
+status: “active”,
+createdBy: “business1”,
+createdAt: new Date(),
+totalSlots: 1000,
+completedSlots: 156,
+instructions: “Look at each photo and rate based on lighting, composition, and food presentation”
+},
+{
+id: 2,
+title: “Transcribe audio clips”,
+description: “Convert 10-word audio clips to text”,
+category: “Transcription”,
+reward: 0.50,
+timeEstimate: “1 min”,
+requiredSkills: [“Excellent English”, “Good Hearing”],
+status: “active”,
+createdBy: “business2”,
+createdAt: new Date(),
+totalSlots: 500,
+completedSlots: 78,
+instructions: “Listen carefully and type exactly what you hear”
+}
+];
+
+tasks = sampleTasks.map((task, index) => ({ …task, id: index + 1 }));
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+const authHeader = req.headers[‘authorization’];
+const token = authHeader && authHeader.split(’ ’)[1];
+
+if (!token) {
+return res.status(401).json({ error: ‘Access token required’ });
+}
+
+jwt.verify(token, JWT_SECRET, (err, user) => {
+if (err) return res.status(403).json({ error: ‘Invalid or expired token’ });
+req.user = user;
+next();
+});
+};
+
+// Helper functions
+const generateId = () => Math.floor(Math.random() * 1000000);
+const calculateCommission = (amount) => amount * 0.15;
+
+// ======================
+// AUTHENTICATION ROUTES
+// ======================
+
+// Register
+app.post(’/api/auth/register’, async (req, res) => {
+try {
+const { email, password, userType, companyName, firstName, lastName } = req.body;
+
+```
+// Validation
+if (!email || !password || !userType) {
+  return res.status(400).json({ error: 'Email, password, and user type are required' });
+}
+
+// Check if user already exists
+if (users.find(u => u.email === email)) {
+  return res.status(400).json({ error: 'User already exists' });
+}
+
+// Hash password
+const hashedPassword = await bcrypt.hash(password, 10);
+
+// Create user
+const user = {
+  id: generateId(),
+  email,
+  password: hashedPassword,
+  userType, // 'worker' or 'business'
+  companyName: userType === 'business' ? companyName : null,
+  firstName: userType === 'worker' ? firstName : null,
+  lastName: userType === 'worker' ? lastName : null,
+  balance: 0,
+  rating: 5.0,
+  completedTasks: 0,
+  createdAt: new Date(),
+  isVerified: false,
+  status: 'active'
+};
+
+users.push(user);
+
+// Create JWT token
+const token = jwt.sign(
+  { userId: user.id, email: user.email, userType: user.userType },
+  JWT_SECRET,
+  { expiresIn: '7d' }
+);
+
+res.status(201).json({
+  message: 'User registered successfully',
+  token,
+  user: {
+    id: user.id,
+    email: user.email,
+    userType: user.userType,
+    balance: user.balance,
+    rating: user.rating
+  }
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error during registration’ });
+}
+});
+
+// Login
+app.post(’/api/auth/login’, async (req, res) => {
+try {
+const { email, password } = req.body;
+
+```
+// Find user
+const user = users.find(u => u.email === email);
+if (!user) {
+  return res.status(400).json({ error: 'Invalid credentials' });
+}
+
+// Check password
+const validPassword = await bcrypt.compare(password, user.password);
+if (!validPassword) {
+  return res.status(400).json({ error: 'Invalid credentials' });
+}
+
+// Create JWT token
+const token = jwt.sign(
+  { userId: user.id, email: user.email, userType: user.userType },
+  JWT_SECRET,
+  { expiresIn: '7d' }
+);
+
+res.json({
+  message: 'Login successful',
+  token,
+  user: {
+    id: user.id,
+    email: user.email,
+    userType: user.userType,
+    balance: user.balance,
+    rating: user.rating,
+    completedTasks: user.completedTasks
+  }
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error during login’ });
+}
+});
+
+// ======================
+// TASK ROUTES
+// ======================
+
+// Get all active tasks (for workers)
+app.get(’/api/tasks’, (req, res) => {
+const { category, minReward, maxReward, sortBy } = req.query;
+
+let filteredTasks = tasks.filter(task => task.status === ‘active’);
+
+// Apply filters
+if (category) {
+filteredTasks = filteredTasks.filter(task =>
+task.category.toLowerCase().includes(category.toLowerCase())
+);
+}
+
+if (minReward) {
+filteredTasks = filteredTasks.filter(task => task.reward >= parseFloat(minReward));
+}
+
+if (maxReward) {
+filteredTasks = filteredTasks.filter(task => task.reward <= parseFloat(maxReward));
+}
+
+// Sort tasks
+if (sortBy === ‘reward_desc’) {
+filteredTasks.sort((a, b) => b.reward - a.reward);
+} else if (sortBy === ‘reward_asc’) {
+filteredTasks.sort((a, b) => a.reward - b.reward);
+} else if (sortBy === ‘newest’) {
+filteredTasks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+res.json({ tasks: filteredTasks });
+});
+
+// Get specific task details
+app.get(’/api/tasks/:id’, (req, res) => {
+const task = tasks.find(t => t.id === parseInt(req.params.id));
+if (!task) {
+return res.status(404).json({ error: ‘Task not found’ });
+}
+res.json({ task });
+});
+
+// Create new task (business users only)
+app.post(’/api/tasks’, authenticateToken, upload.array(‘files’, 5), (req, res) => {
+try {
+if (req.user.userType !== ‘business’) {
+return res.status(403).json({ error: ‘Only business users can create tasks’ });
+}
+
+```
+const {
+  title,
+  description,
+  category,
+  reward,
+  timeEstimate,
+  totalSlots,
+  instructions,
+  requiredSkills
+} = req.body;
+
+// Validation
+if (!title || !description || !reward || !totalSlots) {
+  return res.status(400).json({ error: 'Missing required fields' });
+}
+
+const task = {
+  id: generateId(),
+  title,
+  description,
+  category,
+  reward: parseFloat(reward),
+  timeEstimate,
+  totalSlots: parseInt(totalSlots),
+  completedSlots: 0,
+  instructions,
+  requiredSkills: requiredSkills ? requiredSkills.split(',') : [],
+  status: 'active',
+  createdBy: req.user.userId,
+  createdAt: new Date(),
+  files: req.files ? req.files.map(f => f.filename) : []
+};
+
+tasks.push(task);
+
+res.status(201).json({
+  message: 'Task created successfully',
+  task
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error creating task’ });
+}
+});
+
+// ======================
+// SUBMISSION ROUTES
+// ======================
+
+// Submit task completion
+app.post(’/api/tasks/:id/submit’, authenticateToken, upload.array(‘files’, 3), (req, res) => {
+try {
+if (req.user.userType !== ‘worker’) {
+return res.status(403).json({ error: ‘Only workers can submit tasks’ });
+}
+
+```
+const taskId = parseInt(req.params.id);
+const task = tasks.find(t => t.id === taskId);
+
+if (!task) {
+  return res.status(404).json({ error: 'Task not found' });
+}
+
+if (task.completedSlots >= task.totalSlots) {
+  return res.status(400).json({ error: 'Task is full' });
+}
+
+// Check if user already submitted this task
+const existingSubmission = submissions.find(s => 
+  s.taskId === taskId && s.workerId === req.user.userId
+);
+
+if (existingSubmission) {
+  return res.status(400).json({ error: 'You have already submitted this task' });
+}
+
+const submission = {
+  id: generateId(),
+  taskId,
+  workerId: req.user.userId,
+  data: req.body,
+  files: req.files ? req.files.map(f => f.filename) : [],
+  status: 'pending',
+  submittedAt: new Date()
+};
+
+submissions.push(submission);
+
+// Update task completion count
+task.completedSlots += 1;
+
+res.status(201).json({
+  message: 'Task submitted successfully',
+  submission: {
+    id: submission.id,
+    status: submission.status,
+    submittedAt: submission.submittedAt
+  }
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error submitting task’ });
+}
+});
+
+// Get user’s submissions
+app.get(’/api/submissions’, authenticateToken, (req, res) => {
+const userSubmissions = submissions.filter(s => s.workerId === req.user.userId);
+
+const enrichedSubmissions = userSubmissions.map(submission => {
+const task = tasks.find(t => t.id === submission.taskId);
+return {
+…submission,
+task: task ? {
+title: task.title,
+reward: task.reward,
+category: task.category
+} : null
+};
+});
+
+res.json({ submissions: enrichedSubmissions });
+});
+
+// Approve/Reject submission (business users only)
+app.put(’/api/submissions/:id/review’, authenticateToken, (req, res) => {
+try {
+if (req.user.userType !== ‘business’) {
+return res.status(403).json({ error: ‘Only business users can review submissions’ });
+}
+
+```
+const { status, feedback } = req.body; // status: 'approved' or 'rejected'
+const submissionId = parseInt(req.params.id);
+
+const submission = submissions.find(s => s.id === submissionId);
+if (!submission) {
+  return res.status(404).json({ error: 'Submission not found' });
+}
+
+const task = tasks.find(t => t.id === submission.taskId);
+if (task.createdBy !== req.user.userId) {
+  return res.status(403).json({ error: 'You can only review your own tasks' });
+}
+
+submission.status = status;
+submission.feedback = feedback;
+submission.reviewedAt = new Date();
+
+// If approved, pay the worker
+if (status === 'approved') {
+  const worker = users.find(u => u.id === submission.workerId);
+  if (worker) {
+    worker.balance += task.reward;
+    worker.completedTasks += 1;
+
+    // Create transaction record
+    transactions.push({
+      id: generateId(),
+      type: 'task_payment',
+      userId: worker.id,
+      amount: task.reward,
+      description: `Payment for: ${task.title}`,
+      createdAt: new Date()
+    });
+
+    // Platform commission
+    transactions.push({
+      id: generateId(),
+      type: 'platform_commission',
+      userId: 'platform',
+      amount: calculateCommission(task.reward),
+      description: `Commission from: ${task.title}`,
+      createdAt: new Date()
+    });
+  }
+}
+
+res.json({
+  message: `Submission ${status} successfully`,
+  submission
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error reviewing submission’ });
+}
+});
+
+// ======================
+// USER ROUTES
+// ======================
+
+// Get user profile
+app.get(’/api/profile’, authenticateToken, (req, res) => {
+const user = users.find(u => u.id === req.user.userId);
+if (!user) {
+return res.status(404).json({ error: ‘User not found’ });
+}
+
+const { password, …userProfile } = user;
+res.json({ user: userProfile });
+});
+
+// Update user profile
+app.put(’/api/profile’, authenticateToken, (req, res) => {
+try {
+const user = users.find(u => u.id === req.user.userId);
+if (!user) {
+return res.status(404).json({ error: ‘User not found’ });
+}
+
+```
+const { firstName, lastName, companyName } = req.body;
+
+if (firstName) user.firstName = firstName;
+if (lastName) user.lastName = lastName;
+if (companyName && user.userType === 'business') user.companyName = companyName;
+
+const { password, ...userProfile } = user;
+res.json({
+  message: 'Profile updated successfully',
+  user: userProfile
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error updating profile’ });
+}
+});
+
+// ======================
+// FINANCIAL ROUTES
+// ======================
+
+// Get user’s transaction history
+app.get(’/api/transactions’, authenticateToken, (req, res) => {
+const userTransactions = transactions.filter(t => t.userId === req.user.userId);
+res.json({ transactions: userTransactions });
+});
+
+// Withdraw funds (simplified - integrate with real payment processor)
+app.post(’/api/withdraw’, authenticateToken, (req, res) => {
+try {
+const { amount } = req.body;
+const user = users.find(u => u.id === req.user.userId);
+
+```
+if (!user) {
+  return res.status(404).json({ error: 'User not found' });
+}
+
+if (amount > user.balance) {
+  return res.status(400).json({ error: 'Insufficient balance' });
+}
+
+if (amount < 10) {
+  return res.status(400).json({ error: 'Minimum withdrawal is £10' });
+}
+
+// Process withdrawal (integrate with Stripe, PayPal, etc.)
+user.balance -= amount;
+
+transactions.push({
+  id: generateId(),
+  type: 'withdrawal',
+  userId: user.id,
+  amount: -amount,
+  description: 'Withdrawal to bank account',
+  createdAt: new Date(),
+  status: 'processing'
+});
+
+res.json({
+  message: 'Withdrawal processed successfully',
+  newBalance: user.balance
+});
+```
+
+} catch (error) {
+res.status(500).json({ error: ‘Server error processing withdrawal’ });
+}
+});
+
+// ======================
+// ANALYTICS ROUTES
+// ======================
+
+// Get platform analytics (admin only - simplified)
+app.get(’/api/analytics’, (req, res) => {
+const totalUsers = users.length;
+const totalTasks = tasks.length;
+const totalSubmissions = submissions.length;
+const totalRevenue = transactions
+.filter(t => t.type === ‘platform_commission’)
+.reduce((sum, t) => sum + t.amount, 0);
+
+const activeWorkers = users.filter(u => u.userType === ‘worker’ && u.completedTasks > 0).length;
+const activeBusinesses = users.filter(u => u.userType === ‘business’).length;
+
+res.json({
+analytics: {
+totalUsers,
+totalTasks,
+totalSubmissions,
+totalRevenue: totalRevenue.toFixed(2),
+activeWorkers,
+activeBusinesses,
+averageTaskReward: tasks.reduce((sum, t) => sum + t.reward, 0) / tasks.length || 0
+}
+});
+});
+
+// ======================
+// NOTIFICATION SYSTEM
+// ======================
+
+// Get user notifications
+app.get(’/api/notifications’, authenticateToken, (req, res) => {
+const userNotifications = notifications.filter(n => n.userId === req.user.userId);
+res.json({ notifications: userNotifications });
+});
+
+// Mark notification as read
+app.put(’/api/notifications/:id/read’, authenticateToken, (req, res) => {
+const notification = notifications.find(n =>
+n.id === parseInt(req.params.id) && n.userId === req.user.userId
+);
+
+if (!notification) {
+return res.status(404).json({ error: ‘Notification not found’ });
+}
+
+notification.read = true;
+res.json({ message: ‘Notification marked as read’ });
+});
+
+// ======================
+// SERVER SETUP
+// ======================
+
+// Health check
+app.get(’/api/health’, (req, res) => {
+res.json({
+status: ‘OK’,
+timestamp: new Date(),
+uptime: process.uptime(),
+users: users.length,
+tasks: tasks.length
+});
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+console.error(‘Error:’, error);
+res.status(500).json({ error: ‘Internal server error’ });
+});
+
+// 404 handler
+app.use((req, res) => {
+res.status(404).json({ error: ‘Route not found’ });
+});
+
+// Start server
+app.listen(PORT, () => {
+console.log(`🚀 TaskFlow Backend Server running on port ${PORT}`);
+console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+console.log(`📝 API Documentation available at endpoints`);
+console.log(`💾 Using in-memory storage (replace with real database for production)`);
+});
+
+// Graceful shutdown
+process.on(‘SIGINT’, () => {
+console.log(’\n🛑 Shutting down server…’);
+process.exit(0);
+});
+
+module.exports = app;
